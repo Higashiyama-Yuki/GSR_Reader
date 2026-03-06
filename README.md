@@ -1,133 +1,87 @@
-# GSR（皮膚電気反応）計測システム
+# GSR Reader
 
-人の指に付けたセンサーで「汗の量の変化」を測るシステムです。2本の指に1つずつセンサーを付けて、同時に測ることができます。緊張したり驚いたりすると汗が増えるので、その変化をパソコンの画面でグラフとして確認できます。
+**Galvanic Skin Response** dual-channel data acquisition & analysis system.
 
+## Hardware
 
-## このシステムでできること
+| Component | Detail |
+|---|---|
+| Board | Seeedstudio XIAO SAMD21 |
+| Sensor 1 | Grove GSR → Grove connector (A0) |
+| Sensor 2 | Grove GSR → ピン直接接続 (A1) |
+| ADC | 12-bit (0–4095) |
+| Sampling | 100 Hz |
+| Interface | USB Serial @ 115200 baud |
 
-- 2本の指の汗の変化をリアルタイムでグラフに表示する
-- 測ったデータをファイルに保存する
-- 保存したデータから「ゆるやかな変化」と「急な反応」を分けて分析する
-- 2本の指の反応が同じタイミングで起きているか（同期しているか）を調べる
-
-
-## 必要なもの
-
-| 部品 | 説明 |
-|------|------|
-| Seeedstudio XIAO ESP32C3 | 小さなマイコンボード。プログラムを入れて動かす |
-| Grove拡張ボード | センサーをかんたんに接続するための板 |
-| Grove GSRセンサー 2個 | 指に付けて汗を測るセンサー |
-| USBケーブル (Type-C) | マイコンとパソコンをつなぐケーブル |
-
-
-## セットアップ
-
-### 1. センサーをつなぐ
-
-1. XIAO ESP32C3をGrove拡張ボードに差し込む
-2. GSRセンサー1個目を、拡張ボードの **A0** と書かれたポートにつなぐ
-3. GSRセンサー2個目を、拡張ボードの **A1** と書かれたポートにつなぐ
-4. USBケーブルでパソコンにつなぐ
-
-### 2. マイコンにプログラムを書き込む
-
-パソコンでターミナル（コマンドプロンプト）を開き、以下を入力します。
+### Wiring
 
 ```
-cd GSR
-pio run --target upload
+XIAO SAMD21 (上面から)
+
+        USB-C
+    ┌───────────┐
+ A0 │ ●       ● │ 5V        ← CH1: Grove connector (A0)
+ A1 │ ●       ● │ GND       ← CH2: センサー2 SIG → A1
+ A2 │ ●       ● │ 3V3            センサー2 VCC → 3V3
+ A3 │ ●       ● │ D10            センサー2 GND → GND
+ A4 │ ●       ● │ D9
+ A5 │ ●       ● │ D8
+    └───────────┘
+
+CH1: Grove GSR → Grove コネクタに差すだけ (A0)
+CH2: Grove GSR → ジャンパワイヤで A1, 3V3, GND に接続
 ```
 
-※ `pio` は PlatformIO というツールです。VS Codeの拡張機能としてインストールできます。
-
-### 3. パソコン側の準備
+## Serial Protocol
 
 ```
+# GSR Dual Sensor Stream
+# Format: timestamp_ms,gsr1,gsr2
+# START
+1042,1523,1480
+1052,1518,1475
+...
+```
+
+## Quick Start
+
+### 1. Flash Firmware
+
+```bash
+pio run -t upload
+```
+
+### 2. Install Python Dependencies
+
+```bash
 cd pc
 pip install -r requirements.txt
 ```
 
-これで、データを受け取ったり分析したりするためのソフトがインストールされます。
+### 3. Real-Time Plot
 
-
-## 使い方
-
-### リアルタイムでグラフを見る
-
-```
+```bash
 python pc/plotter.py --port COM5
+python pc/plotter.py --port COM5 --window 30
 ```
 
-画面に波形がリアルタイムで表示されます。閉じるにはウィンドウの×ボタンを押してください。
+### 4. Record Data
 
-※ `COM5` の部分は、パソコンによって番号が違います。どのポートか分からない場合は、以下のコマンドで確認できます。
-
-```
-python pc/plotter.py --list
-```
-
-### データを保存する
-
-```
+```bash
 python pc/receiver.py --port COM5
+python pc/receiver.py --port COM5 -d 60
 ```
 
-`data/` フォルダに日時が付いたファイルとして保存されます。止めたいときは `Ctrl+C` を押します。
+### 5. Offline Analysis
 
-時間を決めて保存する場合（例：60秒間）：
-
-```
-python pc/receiver.py --port COM5 --duration 60
-```
-
-### 保存したデータを分析する
-
-```
-python pc/process_gsr.py data/保存したファイル名.csv --plot --sync
+```bash
+python pc/process_gsr.py data/session.csv --plot
+python pc/process_gsr.py data/session.csv --sync --plot
+python pc/process_gsr.py data/session.csv --method cvxEDA --plot
 ```
 
-4つのグラフが表示されます。
+## Troubleshooting
 
-1. **生データ** — センサーから読み取ったそのままの値
-2. **ゆるやかな変化** — ベースラインがゆっくり上下する成分
-3. **急な反応（指1）** — 驚きや緊張のときに出る素早い反応
-4. **急な反応（指2）** — もう片方の指の反応
-
-`--sync` を付けると、2本の指の反応が同じタイミングで起きている割合も表示されます。
-
-### ノイズを減らして滑らかにしたいとき
-
-```
-python pc/process_gsr.py data/ファイル名.csv --gaussian 20 --plot
-```
-
-`--gaussian 20` を付けると、細かな揺れを取り除いて滑らかなグラフになります。数字を大きくするほど滑らかになりますが、細かい反応が見えにくくなります。
-
-
-## うまく動かないとき
-
-**ポート番号がわからない**
-→ `python pc/plotter.py --list` を実行すると、つながっている機器の一覧が出ます。
-
-**グラフの値が動かない、または変な値が出る**
-→ センサーが指にしっかり触れているか確認してください。指が乾燥していると値が小さくなります。
-
-**どの分析方法を使えばいいかわからない**
-→ まずはオプションなしで試してください。より正確にしたい場合は `--method cvxEDA` を付けてください。
-
-
-## ファイル構成
-
-```
-GSR/
-├── platformio.ini       ← マイコンの設定ファイル
-├── README.md            ← この説明書
-├── src/
-│   └── main.cpp         ← マイコン側のプログラム
-└── pc/
-    ├── requirements.txt ← 必要なソフトの一覧
-    ├── receiver.py      ← データ保存ツール
-    ├── plotter.py       ← リアルタイム表示ツール
-    └── process_gsr.py   ← 分析ツール
-```
+- **プロットが更新されない**: SAMD21は `while (!Serial)` でPC接続を待つ仕様。plotter.py起動後にボードをリセットすると確実
+- **ポート確認**: `python pc/plotter.py --list`
+- **生データ確認**: Arduino IDE シリアルモニタ（115200 baud）で CSV 形式を確認

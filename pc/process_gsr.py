@@ -41,16 +41,8 @@ except ImportError:
 # ── Grove GSR Sensor Constants ─────────────────────────────────────
 # Reference: https://wiki.seeedstudio.com/Grove-GSR_Sensor/
 #
-# Official formula (10-bit ADC, 0-1023):
-#   R_human = ((1024 + 2 * ADC) * 10000) / (512 - ADC)
-#
-# For 12-bit ADC (XIAO ESP32C3, 0-4095), we scale:
+# For 12-bit ADC (XIAO SAMD21, 0-4095):
 #   R_human = ((4096 + 2 * ADC) * 10000) / (2048 - ADC)
-#
-# Note: The denominator uses (ADC_MAX/2 - ADC). The Seeedstudio wiki
-# uses a calibration value from adjusting the potentiometer, but for
-# a demo setup without calibration, ADC_MAX/2 is a reasonable default.
-# If you calibrate, replace SERIAL_CALIBRATION below.
 ADC_BITS = 12
 ADC_MAX = 2**ADC_BITS  # 4096
 SERIAL_CALIBRATION = ADC_MAX // 2  # 2048 (default; adjust after calibration)
@@ -64,16 +56,12 @@ def raw_to_conductance(raw: np.ndarray) -> np.ndarray:
     Uses the official Grove GSR formula adapted for 12-bit ADC:
         R_human (Ω) = ((4096 + 2 * ADC) * 10000) / (2048 - ADC)
         Conductance (μS) = 1e6 / R_human
-
-    Values at or above the calibration point are clamped to avoid
-    division by zero or negative resistance.
     """
     raw_clamped = np.clip(raw, 0, SERIAL_CALIBRATION - 1)
 
     resistance = ((ADC_MAX + 2.0 * raw_clamped) * R_SCALE) / (
         SERIAL_CALIBRATION - raw_clamped
     )
-    # Avoid zero resistance
     resistance = np.maximum(resistance, 1.0)
     conductance_us = 1e6 / resistance
     return conductance_us
@@ -88,40 +76,17 @@ def process_channel_nk(
     method: str = "highpass",
     gaussian_sigma: float | None = None,
 ) -> dict:
-    """
-    Process a single GSR channel using neurokit2.
-
-    Pipeline:
-      1. eda_clean() — Butterworth LPF 3Hz (removes high-freq noise)
-      2. eda_phasic() — Decomposes into Tonic (SCL) and Phasic (SCR)
-         - "highpass": Butterworth HPF 0.05Hz (Biopac standard)
-         - "cvxEDA":  Convex optimization (Greco 2016, requires cvxopt)
-         - "smoothmedian": Median smoothing (Biopac Acqknowledge)
-      3. Optional Gaussian smoothing on phasic component
-      4. eda_peaks() — SCR peak detection
-
-    Args:
-        conductance: Skin conductance in μS
-        fs: Sampling rate in Hz
-        method: Decomposition method ("highpass", "cvxEDA", "smoothmedian")
-        gaussian_sigma: If set, apply Gaussian smoothing (σ in samples)
-                        to the phasic component before peak detection.
-                        Typical: 0.2*fs (0.2s window at 100Hz → σ=20)
-    """
-    # Step 1: Clean (LPF 3Hz, Butterworth 4th order)
+    """Process a single GSR channel using neurokit2."""
     cleaned = nk.eda_clean(conductance, sampling_rate=int(fs), method="neurokit")
 
-    # Step 2: Tonic/Phasic decomposition
     decomposed = nk.eda_phasic(cleaned, sampling_rate=int(fs), method=method)
     scl = decomposed["EDA_Tonic"].values
     scr = decomposed["EDA_Phasic"].values
 
-    # Step 3: Optional Gaussian smoothing on phasic
     scr_smoothed = scr
     if gaussian_sigma is not None and gaussian_sigma > 0:
         scr_smoothed = gaussian_filter1d(scr, sigma=gaussian_sigma)
 
-    # Step 4: Peak detection via neurokit2
     peak_signal, peak_info = nk.eda_peaks(
         scr_smoothed, sampling_rate=int(fs), method="neurokit"
     )
@@ -158,34 +123,22 @@ def process_channel_scipy(
     fs: float = 100.0,
     gaussian_sigma: float | None = None,
 ) -> dict:
-    """
-    Fallback pipeline using only scipy (when neurokit2 is unavailable).
-
-    Pipeline:
-      1. Butterworth LPF 3Hz (noise removal, matches neurokit2 default)
-      2. Butterworth HPF 0.05Hz (tonic/phasic split, Biopac standard)
-      3. Optional Gaussian smoothing on phasic
-      4. scipy peak detection
-    """
+    """Fallback pipeline using only scipy."""
     nyq = fs / 2.0
 
-    # Step 1: Clean — LPF 3Hz
     clean_cutoff = min(3.0, nyq * 0.9)
     b_lp, a_lp = sig.butter(4, clean_cutoff / nyq, btype="low")
     cleaned = sig.filtfilt(b_lp, a_lp, conductance)
 
-    # Step 2: Tonic/Phasic — HPF 0.05Hz
     phasic_cutoff = min(0.05, nyq * 0.9)
     b_hp, a_hp = sig.butter(4, phasic_cutoff / nyq, btype="high")
     scr = sig.filtfilt(b_hp, a_hp, cleaned)
     scl = cleaned - scr
 
-    # Step 3: Optional Gaussian smoothing
     scr_smoothed = scr
     if gaussian_sigma is not None and gaussian_sigma > 0:
         scr_smoothed = gaussian_filter1d(scr, sigma=gaussian_sigma)
 
-    # Step 4: Peak detection
     min_distance_samples = int(1.0 * fs)
     peaks_idx, props = sig.find_peaks(
         scr_smoothed,
@@ -222,12 +175,7 @@ def compute_synchrony(
     peaks2: dict,
     tolerance_sec: float = 2.0,
 ) -> dict:
-    """
-    Compute dual-channel SCR synchrony.
-
-    For each peak in ch1, find the closest peak in ch2 within tolerance.
-    Reports synchrony ratio and mean latency.
-    """
+    """Compute dual-channel SCR synchrony."""
     t1 = peaks1["times_sec"]
     t2 = peaks2["times_sec"]
 
@@ -358,7 +306,6 @@ def plot_results(results: dict, show_gaussian: bool = False, output: Path | None
         ax.plot(t, results[ch]["scr"], color=colors[ch], linewidth=0.6,
                 alpha=0.5, label=f"{ch.upper()} SCR")
 
-        # Show Gaussian-smoothed if different
         if show_gaussian and not np.array_equal(results[ch]["scr"], results[ch]["scr_smoothed"]):
             ax.plot(t, results[ch]["scr_smoothed"], color=colors[ch],
                     linewidth=1.2, label=f"{ch.upper()} smoothed")
@@ -433,8 +380,7 @@ Examples:
     parser.add_argument(
         "--gaussian", "-g", type=float, default=None,
         help="Gaussian smoothing σ in samples for phasic component. "
-             "Typical: 10-30 at 100Hz (100-300ms window). "
-             "Reduces noise in SCR peak detection.",
+             "Typical: 10-30 at 100Hz (100-300ms window).",
     )
     parser.add_argument(
         "--calibration", type=int, default=None,
@@ -448,7 +394,6 @@ Examples:
         print(f"File not found: {filepath}")
         sys.exit(1)
 
-    # Override calibration if provided
     global SERIAL_CALIBRATION
     if args.calibration is not None:
         SERIAL_CALIBRATION = args.calibration

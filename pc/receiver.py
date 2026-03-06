@@ -1,6 +1,6 @@
 """
 GSR Serial Receiver
-Reads CSV data from ESP32C3 over serial and saves to file.
+Reads CSV data from XIAO SAMD21 over serial and saves to file.
 
 Usage:
     python receiver.py --port COM5
@@ -57,7 +57,7 @@ def receive(port: str, baud: int, output: Path, duration: float | None):
 
     start_time = time.time()
     sample_count = 0
-    header_done = False
+    parse_errors = 0
 
     with open(output, "w", newline="") as f:
         writer = csv.writer(f)
@@ -77,13 +77,13 @@ def receive(port: str, baud: int, output: Path, duration: float | None):
                 # Skip header/comment lines from firmware
                 if line.startswith("#"):
                     if "START" in line:
-                        header_done = True
                         print("Stream started.")
                     continue
 
                 # Parse CSV: timestamp_ms,gsr1,gsr2
                 parts = line.split(",")
                 if len(parts) != 3:
+                    parse_errors += 1
                     continue
 
                 try:
@@ -91,6 +91,7 @@ def receive(port: str, baud: int, output: Path, duration: float | None):
                     gsr1 = int(parts[1])
                     gsr2 = int(parts[2])
                 except ValueError:
+                    parse_errors += 1
                     continue
 
                 writer.writerow([ts, gsr1, gsr2])
@@ -103,7 +104,8 @@ def receive(port: str, baud: int, output: Path, duration: float | None):
                     print(
                         f"\r  Samples: {sample_count}  "
                         f"Rate: {rate:.1f} Hz  "
-                        f"GSR1: {gsr1:4d}  GSR2: {gsr2:4d}",
+                        f"GSR1: {gsr1:4d}  GSR2: {gsr2:4d}  "
+                        f"Errors: {parse_errors}",
                         end="",
                     )
 
@@ -112,6 +114,8 @@ def receive(port: str, baud: int, output: Path, duration: float | None):
 
     elapsed = time.time() - start_time
     print(f"\nTotal: {sample_count} samples in {elapsed:.1f}s")
+    if parse_errors:
+        print(f"Parse errors: {parse_errors}")
     print(f"Saved to: {output}")
     ser.close()
 
