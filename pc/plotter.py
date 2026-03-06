@@ -1,40 +1,62 @@
 """
-GSR Real-Time Plotter
-Reads serial data from XIAO SAMD21 and plots live dual-channel GSR.
+GSR Real-Time Plotter with Synchrony Analysis
+Reads serial data from XIAO SAMD21 and plots live dual-channel GSR
+with real-time synchrony metrics (correlation, PLV, common mode).
 
 Usage:
-    python plotter.py --port COM5
-    python plotter.py --port COM5 --window 30   # 30-second window
+    python plotter.py --port COM12
+    python plotter.py --port COM12 --save --process
+    python plotter.py --port COM12 --window 30
 """
 
 import argparse
+import csv
+import subprocess
 import sys
 import time
 from collections import deque
+from datetime import datetime
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+import numpy as np
 import serial
 import serial.tools.list_ports
 
+from dsp import RealtimeDSP
+
 
 class GSRPlotter:
-    """Real-time dual-channel GSR plotter."""
+    """Real-time dual-channel GSR plotter with synchrony analysis."""
 
-    def __init__(self, port: str, baud: int, window_sec: float = 10.0):
+    def __init__(self, port: str, baud: int, window_sec: float = 10.0,
+                 save_path: Path | None = None):
         self.port = port
         self.baud = baud
         self.window_sec = window_sec
-        self.sample_rate = 100  # Expected Hz
+        self.sample_rate = 100
 
-        max_points = int(window_sec * self.sample_rate * 1.2)  # 20% buffer
+        max_points = int(window_sec * self.sample_rate * 1.2)
         self.times = deque(maxlen=max_points)
         self.gsr1 = deque(maxlen=max_points)
         self.gsr2 = deque(maxlen=max_points)
+        self.common_mode = deque(maxlen=max_points)
+        self.r_values = deque(maxlen=max_points)
+        self.plv_values = deque(maxlen=max_points)
         self.t0 = None
         self.ser = None
         self.parse_errors = 0
         self.good_samples = 0
+
+        # DSP engine
+        self.dsp = RealtimeDSP(fs=self.sample_rate, window_sec=window_sec)
+        self.latest_metrics = None
+
+        # Recording
+        self.save_path = save_path
+        self.csv_file = None
+        self.csv_writer = None
 
     def connect(self):
         """Open serial connection."""
@@ -44,6 +66,23 @@ class GSRPlotter:
         except serial.SerialException as e:
             print(f"Error: {e}")
             sys.exit(1)
+
+    def start_recording(self):
+        """Open CSV file for recording."""
+        if self.save_path is None:
+            return
+        self.save_path.parent.mkdir(parents=True, exist_ok=True)
+        self.csv_file = open(self.save_path, "w", newline="")
+        self.csv_writer = csv.writer(self.csv_file)
+        self.csv_writer.writerow(["timestamp_ms", "gsr1_raw", "gsr2_raw"])
+        print(f"Recording to: {self.save_path}")
+
+    def stop_recording(self):
+        """Close CSV file."""
+        if self.csv_file:
+            self.csv_file.close()
+            self.csv_file = None
+            print(f"Saved {self.good_samples} samples to: {self.save_path}")
 
     def read_samples(self):
         """Read all available samples from serial buffer."""
@@ -85,87 +124,142 @@ class GSRPlotter:
             self.gsr2.append(g2)
             self.good_samples += 1
 
+            # DSP processing
+            metrics = self.dsp.update(float(g1), float(g2))
+            self.latest_metrics = metrics
+            self.common_mode.append(metrics["common_mode"])
+            self.r_values.append(metrics["r_value"])
+            self.plv_values.append(metrics["plv"])
+
+            # Write to CSV
+            if self.csv_writer:
+                self.csv_writer.writerow([ts_ms, g1, g2])
+
     def setup_plot(self):
-        """Create the matplotlib figure."""
+        """Create the matplotlib figure with synchrony panels."""
         plt.style.use("dark_background")
-        self.fig, (self.ax1, self.ax2) = plt.subplots(
-            2, 1, figsize=(12, 6), sharex=True
+        self.fig, axes = plt.subplots(
+            4, 1, figsize=(12, 9),
+            gridspec_kw={"height_ratios": [3, 3, 2, 2]},
         )
-        self.fig.suptitle("GSR Dual Sensor - Live", fontsize=14, fontweight="bold")
+        self.ax_ch1, self.ax_ch2, self.ax_common, self.ax_sync = axes
 
-        # Channel 1 (Grove A0)
-        (self.line1,) = self.ax1.plot([], [], color="#00d4ff", linewidth=1.2, label="GSR 1 (Grove A0)")
-        self.ax1.set_ylabel("Raw ADC (12-bit)")
-        self.ax1.set_ylim(0, 4095)
-        self.ax1.legend(loc="upper right")
-        self.ax1.grid(True, alpha=0.3)
+        title = "GSR Dual Sensor — Live Synchrony Analysis"
+        if self.save_path:
+            title += "  ● REC"
+        self.fig.suptitle(title, fontsize=13, fontweight="bold")
 
-        # Channel 2 (Pin A1)
-        (self.line2,) = self.ax2.plot([], [], color="#ff6b9d", linewidth=1.2, label="GSR 2 (Pin A1)")
-        self.ax2.set_ylabel("Raw ADC (12-bit)")
-        self.ax2.set_xlabel("Time (s)")
-        self.ax2.set_ylim(0, 4095)
-        self.ax2.legend(loc="upper right")
-        self.ax2.grid(True, alpha=0.3)
+        # CH1
+        (self.line1,) = self.ax_ch1.plot(
+            [], [], color="#00d4ff", linewidth=1.0, label="CH1 (A0)"
+        )
+        self.ax_ch1.set_ylabel("ADC")
+        self.ax_ch1.legend(loc="upper right", fontsize=8)
+        self.ax_ch1.grid(True, alpha=0.2)
+
+        # CH2
+        (self.line2,) = self.ax_ch2.plot(
+            [], [], color="#ff6b9d", linewidth=1.0, label="CH2 (A1)"
+        )
+        self.ax_ch2.set_ylabel("ADC")
+        self.ax_ch2.legend(loc="upper right", fontsize=8)
+        self.ax_ch2.grid(True, alpha=0.2)
+
+        # Common mode
+        (self.line_common,) = self.ax_common.plot(
+            [], [], color="#a0e060", linewidth=1.2, label="共通モード (CH1+CH2)/2"
+        )
+        self.ax_common.set_ylabel("ADC")
+        self.ax_common.legend(loc="upper right", fontsize=8)
+        self.ax_common.grid(True, alpha=0.2)
+
+        # Synchrony (r + PLV)
+        (self.line_r,) = self.ax_sync.plot(
+            [], [], color="#ffdd57", linewidth=1.2, label="Pearson r"
+        )
+        (self.line_plv,) = self.ax_sync.plot(
+            [], [], color="#ff8c42", linewidth=1.2, label="PLV"
+        )
+        self.ax_sync.set_ylabel("同期度")
+        self.ax_sync.set_xlabel("Time (s)")
+        self.ax_sync.set_ylim(-0.1, 1.1)
+        self.ax_sync.axhline(y=0, color="#555555", linewidth=0.5)
+        self.ax_sync.axhline(y=1, color="#555555", linewidth=0.5)
+        self.ax_sync.legend(loc="upper right", fontsize=8)
+        self.ax_sync.grid(True, alpha=0.2)
 
         # Stats text
-        self.stats_text = self.ax1.text(
-            0.01, 0.95, "", transform=self.ax1.transAxes,
-            fontsize=9, verticalalignment="top", color="#aaaaaa",
-            fontfamily="monospace",
+        self.stats_text = self.fig.text(
+            0.01, 0.01, "", fontsize=9, color="#aaaaaa",
+            fontfamily="monospace", verticalalignment="bottom",
         )
 
-        plt.tight_layout()
+        plt.tight_layout(rect=[0, 0.03, 1, 0.97])
 
     def update(self, frame):
         """Animation update callback."""
         self.read_samples()
 
         if not self.times:
-            return self.line1, self.line2, self.stats_text
+            return (self.line1, self.line2, self.line_common,
+                    self.line_r, self.line_plv, self.stats_text)
 
-        times_list = list(self.times)
-        gsr1_list = list(self.gsr1)
-        gsr2_list = list(self.gsr2)
+        t = list(self.times)
+        g1 = list(self.gsr1)
+        g2 = list(self.gsr2)
+        cm = list(self.common_mode)
+        rv = list(self.r_values)
+        pv = list(self.plv_values)
 
-        self.line1.set_data(times_list, gsr1_list)
-        self.line2.set_data(times_list, gsr2_list)
+        # Update lines
+        self.line1.set_data(t, g1)
+        self.line2.set_data(t, g2)
+        self.line_common.set_data(t, cm)
 
-        # Sliding window
-        t_max = times_list[-1]
+        # r and PLV (filter NaN for display)
+        t_arr = np.array(t)
+        rv_arr = np.array(rv)
+        pv_arr = np.array(pv)
+        valid_r = ~np.isnan(rv_arr)
+        valid_p = ~np.isnan(pv_arr)
+        self.line_r.set_data(t_arr[valid_r], rv_arr[valid_r])
+        self.line_plv.set_data(t_arr[valid_p], pv_arr[valid_p])
+
+        # Sliding window X limits
+        t_max = t[-1]
         t_min = max(0, t_max - self.window_sec)
-        self.ax1.set_xlim(t_min, t_max + 0.5)
-        self.ax2.set_xlim(t_min, t_max + 0.5)
+        for ax in [self.ax_ch1, self.ax_ch2, self.ax_common, self.ax_sync]:
+            ax.set_xlim(t_min, t_max + 0.5)
 
-        # Auto-scale Y within visible window
-        visible_idx = [i for i, t in enumerate(times_list) if t >= t_min]
-        if visible_idx:
-            vis_g1 = [gsr1_list[i] for i in visible_idx]
-            vis_g2 = [gsr2_list[i] for i in visible_idx]
-
+        # Auto-scale Y for signal panels
+        vis = [i for i, tv in enumerate(t) if tv >= t_min]
+        if vis:
             margin = 50
-            y1_min, y1_max = min(vis_g1) - margin, max(vis_g1) + margin
-            y2_min, y2_max = min(vis_g2) - margin, max(vis_g2) + margin
+            for ax, data in [(self.ax_ch1, g1), (self.ax_ch2, g2), (self.ax_common, cm)]:
+                vis_d = [data[i] for i in vis]
+                y_lo, y_hi = min(vis_d) - margin, max(vis_d) + margin
+                ax.set_ylim(max(0, y_lo), min(4095, y_hi))
 
-            self.ax1.set_ylim(max(0, y1_min), min(4095, y1_max))
-            self.ax2.set_ylim(max(0, y2_min), min(4095, y2_max))
-
-            # Stats
+        # Stats
+        m = self.latest_metrics
+        if m:
+            r_str = f"{m['r_value']:.2f}" if not np.isnan(m["r_value"]) else "---"
+            plv_str = f"{m['plv']:.2f}" if not np.isnan(m["plv"]) else "---"
+            rec = "● REC  " if self.save_path else ""
             self.stats_text.set_text(
-                f"CH1: {gsr1_list[-1]:4d}  (μ={sum(vis_g1)/len(vis_g1):.0f})  |  "
-                f"CH2: {gsr2_list[-1]:4d}  (μ={sum(vis_g2)/len(vis_g2):.0f})  |  "
-                f"N={len(times_list)}  errors={self.parse_errors}"
+                f"{rec}N={self.good_samples}  |  "
+                f"CH1={g1[-1]:4d}  CH2={g2[-1]:4d}  |  "
+                f"r={r_str}  PLV={plv_str}"
             )
 
-        return self.line1, self.line2, self.stats_text
+        return (self.line1, self.line2, self.line_common,
+                self.line_r, self.line_plv, self.stats_text)
 
-    def run(self):
+    def run(self, auto_process: bool = False):
         """Start the live plot."""
         self.connect()
 
-        # Wait for stream start
         print("Waiting for data stream...")
-        print("(If the board doesn't send '# START', will proceed after 10s)")
         timeout = time.time() + 10
         started = False
         while time.time() < timeout:
@@ -183,12 +277,13 @@ class GSRPlotter:
         if not started:
             print("Warning: No START marker detected, proceeding anyway...")
 
+        self.start_recording()
         self.setup_plot()
 
         self.ani = animation.FuncAnimation(
             self.fig,
             self.update,
-            interval=50,  # 20 FPS refresh
+            interval=50,
             blit=False,
             cache_frame_data=False,
         )
@@ -201,30 +296,72 @@ class GSRPlotter:
         finally:
             if self.ser:
                 self.ser.close()
-            print(f"Done. Good samples: {self.good_samples}, Parse errors: {self.parse_errors}")
+            self.stop_recording()
+            print(f"Done. Samples: {self.good_samples}, Errors: {self.parse_errors}")
+
+        if auto_process and self.save_path and self.good_samples > 0:
+            self._run_processing()
+
+    def _run_processing(self):
+        """Launch process_gsr.py on saved data."""
+        script = Path(__file__).parent / "process_gsr.py"
+        cmd = [sys.executable, str(script), str(self.save_path), "--plot", "--sync"]
+        print(f"\n{'='*50}")
+        print(f"  分析開始: process_gsr.py")
+        print(f"  ファイル: {self.save_path}")
+        print(f"{'='*50}\n")
+        subprocess.run(cmd)
 
 
 def main():
     parser = argparse.ArgumentParser(description="GSR Real-Time Plotter")
-    parser.add_argument("--port", "-p", required=True, help="Serial port (e.g. COM5)")
+    parser.add_argument("--port", "-p", help="Serial port (e.g. COM12)")
     parser.add_argument("--baud", "-b", type=int, default=115200, help="Baud rate")
     parser.add_argument(
         "--window", "-w", type=float, default=10.0,
         help="Display window in seconds (default: 10)",
     )
+    parser.add_argument("--save", "-s", action="store_true", help="Save data to CSV")
+    parser.add_argument("--output", "-o", help="Output CSV path (with --save)")
     parser.add_argument(
-        "--list", "-l", action="store_true", help="List available serial ports",
+        "--process", action="store_true",
+        help="Auto-run analysis after recording (implies --save)",
     )
+    parser.add_argument("--list", "-l", action="store_true", help="List serial ports")
     args = parser.parse_args()
 
     if args.list:
         ports = serial.tools.list_ports.comports()
+        if not ports:
+            print("No serial ports found.")
         for p in ports:
             print(f"  {p.device} - {p.description}")
         return
 
-    plotter = GSRPlotter(args.port, args.baud, args.window)
-    plotter.run()
+    if not args.port:
+        ports = serial.tools.list_ports.comports()
+        if not ports:
+            print("No serial ports found.")
+        else:
+            print("Available serial ports:")
+            for p in ports:
+                print(f"  {p.device} - {p.description}")
+        print("\nSpecify a port with --port")
+        sys.exit(1)
+
+    if args.process:
+        args.save = True
+
+    save_path = None
+    if args.save:
+        if args.output:
+            save_path = Path(args.output)
+        else:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_path = Path(f"data/session_{ts}.csv")
+
+    plotter = GSRPlotter(args.port, args.baud, args.window, save_path)
+    plotter.run(auto_process=args.process)
 
 
 if __name__ == "__main__":

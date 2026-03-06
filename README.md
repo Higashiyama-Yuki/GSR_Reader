@@ -1,87 +1,108 @@
 # GSR Reader
 
-**Galvanic Skin Response** dual-channel data acquisition & analysis system.
+皮膚電気反応（GSR）のリアルタイム計測・同期分析システム
 
-## Hardware
+## 🔧 ハードウェア
 
-| Component | Detail |
+| 部品 | 詳細 |
 |---|---|
-| Board | Seeedstudio XIAO SAMD21 |
-| Sensor 1 | Grove GSR → Grove connector (A0) |
-| Sensor 2 | Grove GSR → ピン直接接続 (A1) |
-| ADC | 12-bit (0–4095) |
-| Sampling | 100 Hz |
-| Interface | USB Serial @ 115200 baud |
+| マイコン | Seeedstudio XIAO SAMD21 |
+| センサー 1 | Grove GSR → Groveコネクタ (A0) |
+| センサー 2 | Grove GSR → ピン直接接続 (A1) |
+| ADC | 12bit (0–4095)、サンプリング 100 Hz |
+| 通信 | USB シリアル 115200 baud |
 
-### Wiring
-
-```
-XIAO SAMD21 (上面から)
-
-        USB-C
-    ┌───────────┐
- A0 │ ●       ● │ 5V        ← CH1: Grove connector (A0)
- A1 │ ●       ● │ GND       ← CH2: センサー2 SIG → A1
- A2 │ ●       ● │ 3V3            センサー2 VCC → 3V3
- A3 │ ●       ● │ D10            センサー2 GND → GND
- A4 │ ●       ● │ D9
- A5 │ ●       ● │ D8
-    └───────────┘
-
-CH1: Grove GSR → Grove コネクタに差すだけ (A0)
-CH2: Grove GSR → ジャンパワイヤで A1, 3V3, GND に接続
-```
-
-## Serial Protocol
+### 配線
 
 ```
-# GSR Dual Sensor Stream
-# Format: timestamp_ms,gsr1,gsr2
-# START
-1042,1523,1480
-1052,1518,1475
-...
+XIAO SAMD21 (上面)
+
+          USB-C
+      ┌───────────┐
+  A0  │ ●       ● │ 5V        ← CH1: Groveコネクタ (A0)
+  A1  │ ●       ● │ GND       ← CH2: SIG → A1
+  A2  │ ●       ● │ 3V3            VCC → 3V3, GND → GND
+  A3  │ ●       ● │ D10
+  A4  │ ●       ● │ D9
+  A5  │ ●       ● │ D8
+      └───────────┘
 ```
 
-## Quick Start
+## 🚀 使い方
 
-### 1. Flash Firmware
+### セットアップ
 
 ```bash
-pio run -t upload
+pio run -t upload           # ファームウェア書き込み
+cd pc && pip install -r requirements.txt  # Python依存パッケージ
 ```
 
-### 2. Install Python Dependencies
+### リアルタイム表示（同期分析付き）
 
 ```bash
-cd pc
-pip install -r requirements.txt
+python pc/plotter.py --list              # ポート確認
+python pc/plotter.py -p COM12            # リアルタイム表示
+python pc/plotter.py -p COM12 -w 30      # 30秒ウィンドウ
 ```
 
-### 3. Real-Time Plot
+画面構成（4パネル）：
+1. **CH1** — Grove A0 の生波形
+2. **CH2** — ピン A1 の生波形
+3. **共通モード** — (CH1+CH2)/2（同期成分）
+4. **同期度** — Pearson r（相関係数）＋ PLV（位相同期値）
+
+### データ保存 → 自動分析
 
 ```bash
-python pc/plotter.py --port COM5
-python pc/plotter.py --port COM5 --window 30
+python pc/plotter.py -p COM12 --save             # 保存しながら表示
+python pc/plotter.py -p COM12 --process           # 閉じたら自動分析
 ```
 
-### 4. Record Data
+### オフライン分析
 
 ```bash
-python pc/receiver.py --port COM5
-python pc/receiver.py --port COM5 -d 60
+python pc/process_gsr.py data/session.csv --plot         # SCL/SCR 分解
+python pc/process_gsr.py data/session.csv --plot --sync   # + 同期分析
 ```
 
-### 5. Offline Analysis
+## 📐 リアルタイム DSP パイプライン
 
-```bash
-python pc/process_gsr.py data/session.csv --plot
-python pc/process_gsr.py data/session.csv --sync --plot
-python pc/process_gsr.py data/session.csv --method cvxEDA --plot
+```
+生ADC値 (100Hz)
+    ↓
+EMA 平滑化 (α=2/21, ~200ms窓)  ← 因果的ガウシアン近似
+    ↓
+┌───────────────────────────────────┐
+│ 共通モード = (CH1 + CH2) / 2      │ → 同期波形パネル
+│ 差分モード = (CH1 - CH2) / 2      │ → アーティファクト
+├───────────────────────────────────┤
+│ Rolling Pearson r (10s窓)         │ → 同期度パネル
+├───────────────────────────────────┤
+│ 因果バンドパス 0.05–0.5 Hz        │
+│ → Hilbert変換 → 瞬時位相          │
+│ → PLV = |mean(e^(jΔφ))|          │ → 同期度パネル
+└───────────────────────────────────┘
 ```
 
-## Troubleshooting
+## ❓ トラブルシューティング
 
-- **プロットが更新されない**: SAMD21は `while (!Serial)` でPC接続を待つ仕様。plotter.py起動後にボードをリセットすると確実
-- **ポート確認**: `python pc/plotter.py --list`
-- **生データ確認**: Arduino IDE シリアルモニタ（115200 baud）で CSV 形式を確認
+| 症状 | 対処法 |
+|---|---|
+| UIは出るがプロットされない | ボードをリセット（USB-CDC の `while(!Serial)` 待機） |
+| ポートが見つからない | `python pc/plotter.py --list` |
+| PLVが `---` のまま | 5秒以上のデータが必要（低周波帯の位相推定に時間がかかる） |
+
+## 📁 ファイル構成
+
+```
+GSR/
+├── platformio.ini
+├── src/main.cpp            # ファームウェア（2ch → CSV）
+├── pc/
+│   ├── plotter.py          # リアルタイム表示 + 同期分析
+│   ├── dsp.py              # DSPモジュール（EMA, バンドパス, PLV）
+│   ├── receiver.py         # CSV 保存のみ
+│   ├── process_gsr.py      # オフライン SCL/SCR 分解
+│   └── requirements.txt
+└── README.md
+```
